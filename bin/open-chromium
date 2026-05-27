@@ -1,0 +1,416 @@
+#!/usr/bin/osascript -l JavaScript
+// -*- javascript -*-
+//
+// open-chromium: Open a URL in a Chromium-based browser in a specified profile
+//
+// usage: open-chromium [(-a | --application) <app>]
+//                      [(-p | --profile) <profile>] [(-d | --profile-dir) <dir>]
+//                      [(-w | --window) <window>] <url>
+//
+//   <app>: "Chromium" (default), "Google Chrome", "Microsoft Edge", etc.
+//   <profile>: Profile display name as shown in the browser (e.g. "Personal").
+//             Multiple names can be given with : and are tried in order;
+//             the display name is also used to drive the Profiles menu.
+//   <dir>:    Profile directory name (e.g. "Default", "Profile 2") that maps
+//             directly to --profile-directory.  Wins over <profile>.
+//   <window>: Window title, or -- for Microsoft Edge -- a workspace UUID or
+//            workspace name resolved via the profile's Sync Data LevelDB.
+//            For each candidate the matching window title is preferred; only
+//            if no such window is open is a workspace launch attempted.
+//            Multiple values can be given with :, tried in order until one
+//            succeeds.
+//
+// If the URL is already opened in a tab, it is activated.
+
+function first(collection) {
+  return collection.length > 0 ? collection[0] : null;
+}
+
+// Raise a single window to the front without disturbing the rest of the
+// app's window stack.  Delegates to macwin-cli, matching by JXA title.
+// Falls back to app-level activation if macwin-cli is unavailable or the
+// raise fails.
+function activateWindowById(app, id) {
+  const window = app.windows.byId(id);
+  if (!window) {
+    console.log("window is gone!");
+    return false;
+  }
+  const title = window.title();
+  if (!raiseWindowByTitle(app.name(), title)) {
+    app.activate();
+  }
+  return true;
+}
+
+function raiseWindowByTitle(appName, title) {
+  const shell = Application.currentApplication();
+  shell.includeStandardAdditions = true;
+  const cmd = [
+    "macwin-cli",
+    "find",
+    "--app",
+    quoteShellArg(appName),
+    "--where",
+    quoteShellArg(`title == "${title.replace(/(["\\])/g, "\\$1")}"`),
+    "--raise",
+    "--exit-status",
+    ">/dev/null 2>&1",
+  ].join(" ");
+  try {
+    shell.doShellScript(cmd);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function activateTabById(window, id) {
+  Array.from(window.tabs()).forEach((tab, i) => {
+    if (tab.id() === id) {
+      window.activeTabIndex = i + 1;
+      return true;
+    }
+  });
+}
+
+function findTabByURL(window, url) {
+  return Array.from(window.tabs()).find(
+    url instanceof RegExp
+      ? (tab) => tab.url().match(url)
+      : (tab) => tab.url() === url,
+  );
+}
+
+// Find the id of an app window whose title matches windowName.  Returns
+// null if no such window exists.
+function findWindowIdByTitle(app, windowName) {
+  const target = Array.from(app.windows()).find(
+    (window) => window.title() === windowName,
+  );
+  return target ? target.id() : null;
+}
+
+function selectProfile(app, profile) {
+  const system = Application("System Events");
+  const browserAppProc = system.applicationProcesses.byName(app.name());
+  const menuBar = browserAppProc.menuBars[0];
+  const profileNames = profile.split(":");
+  const menu = first(
+    menuBar.menus.whose(
+      {
+        _or: [
+          { name: "Profiles" },
+          // other languages
+          { name: "プロファイル" },
+        ],
+      },
+      { considering: "case" },
+    ),
+  );
+  const menuName = menu.name();
+  const menuItems = menu.menuItems;
+  const menuItem = first(
+    profileNames.flatMap((profileName) =>
+      menuItems.whose(
+        {
+          _or: [
+            { name: profileName },
+            // Older Chromium variants may include the profile key suffix.
+            { name: { _endsWith: ` (${profileName})` } },
+          ],
+        },
+        { considering: "case" },
+      )(),
+    ),
+  );
+  if (!menuItem) return false;
+
+  const menuItemName = menuItem.name();
+  menuItem.click();
+
+  const isSelected = () =>
+    menuBar.menus
+      .byName(menuName)
+      .menuItems.byName(menuItemName)
+      .attributes.byName("AXMenuItemMarkChar")
+      .value() === "✓";
+  // A successful profile-menu click leaves the menu item checked.  We no
+  // longer probe by raising other windows in turn — that side-effect was
+  // exactly what brought non-target profile windows to the front.  If the
+  // click did not stick, return false and let the caller recover (e.g. by
+  // locating a window of the requested profile and raising just that one).
+  return isSelected();
+}
+
+function openUrlInWindow(app, window, url, urlRegExp) {
+  const tab = findTabByURL(window, urlRegExp ?? url);
+  if (tab) {
+    activateTabById(window, tab.id());
+  } else {
+    const tab = first(
+      window.tabs.whose(
+        {
+          _or: [
+            // Chrome, Chromium
+            { url: "chrome://newtab/" },
+            // Microsoft Edge
+            { url: "edge://newtab/" },
+          ],
+        },
+        { considering: "case" },
+      ),
+    );
+    if (tab) {
+      tab.url = url;
+    } else {
+      window.tabs.push(app.Tab({ url }));
+    }
+  }
+
+  activateWindowById(app, window.id());
+}
+
+// Pick the window to operate on.  When a preferredId is given (because the
+// caller resolved -w to a specific window title), use that window verbatim
+// so we don't accidentally fall back to whichever window happens to sit at
+// index 1 — which on Chromium can belong to a different profile entirely.
+function getWindowInMode(app, mode, preferredId) {
+  if (preferredId != null) {
+    const target = Array.from(app.windows()).find(
+      (window) => window.id() === preferredId,
+    );
+    if (target) return target;
+  }
+  return (
+    Array.from(app.windows()).find(
+      (window) => window.index() === 1 && window.mode() === mode,
+    ) ||
+    Array.from(app.windows()).find((window) => window.mode() === mode) ||
+    app.Window({ mode }).make()
+  );
+}
+
+function openUrl(app, url, { urlRegExp, profile, windowName, mode }) {
+  if (windowName || profile) {
+    if (profile && !selectProfile(app, profile)) {
+      console.log("profile not found");
+    }
+
+    // Resolve -w to a concrete window id so we can target that one window
+    // for raising via macwin-cli without disturbing other windows.
+    let targetId = null;
+    if (windowName) {
+      targetId = findWindowIdByTitle(app, windowName);
+    }
+
+    if (!url) {
+      activateWindowById(app, getWindowInMode(app, mode, targetId).id());
+      return;
+    }
+
+    openUrlInWindow(
+      app,
+      getWindowInMode(app, mode, targetId),
+      url,
+      urlRegExp,
+    );
+  } else {
+    if (!url) {
+      activateWindowById(app, getWindowInMode(app, mode).id());
+      return;
+    }
+    Array.from(app.windows()).find((window, i) => {
+      if (window.mode() !== mode) return false;
+      const tab = findTabByURL(window, urlRegExp ?? url);
+      if (tab) {
+        activateWindowById(app, window.id());
+        activateTabById(window, tab.id());
+        return true;
+      }
+      return false;
+    }) || openUrlInWindow(app, getWindowInMode(app, mode), url, urlRegExp);
+  }
+}
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function launchWorkspace(app, profileDir, workspace, urls) {
+  const args = ["--launch-workspace=" + workspace];
+  if (profileDir) {
+    args.push("--profile-directory=" + profileDir);
+  }
+  for (const url of urls) {
+    if (url) args.push(url);
+  }
+
+  const cmd = [
+    "/usr/bin/open",
+    "-a",
+    quoteShellArg(app.name()),
+    ...(app.running() ? ["-n"] : []),
+    "--args",
+    ...args.map(quoteShellArg),
+  ].join(" ");
+
+  const shell = Application.currentApplication();
+  shell.includeStandardAdditions = true;
+  shell.doShellScript(cmd);
+  return true;
+}
+
+function quoteShellArg(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+// Path to this script's directory, where the chromium-profile helper is
+// expected to live as a sibling.  Falls back to null when osascript was
+// invoked without a script file (e.g. via stdin), in which case PATH-based
+// lookup takes over.
+const SCRIPT_DIR = (function () {
+  ObjC.import("Foundation");
+  const argv = $.NSProcessInfo.processInfo.arguments;
+  const last = argv.count > 0 ? argv.objectAtIndex(argv.count - 1).js : "";
+  if (!last || last === "-") return null;
+  return $.NSString.alloc
+    .initWithUTF8String(last)
+    .stringByResolvingSymlinksInPath.stringByDeletingLastPathComponent.js;
+})();
+
+// Invoke the chromium-profile helper.  `args` is an array of CLI arguments
+// appended after the global options.  Returns the captured stdout (trimmed)
+// on success, or null on error / empty output.
+function chromiumProfileLookup(appName, profileDir, args) {
+  const shell = Application.currentApplication();
+  shell.includeStandardAdditions = true;
+  const helper = SCRIPT_DIR
+    ? SCRIPT_DIR + "/chromium-profile"
+    : "chromium-profile";
+  const head = [helper, "-a", appName];
+  if (profileDir) head.push("-p", profileDir);
+  const cmd =
+    head.concat(args).map(quoteShellArg).join(" ") + " 2>/dev/null";
+  try {
+    return shell.doShellScript(cmd).trim() || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function resolveProfileDir(appName, profile) {
+  if (!profile) return null;
+  return chromiumProfileLookup(appName, null, ["dir", profile]);
+}
+
+function resolveWorkspaceUuid(appName, profileDir, name) {
+  if (appName !== "Microsoft Edge") return null;
+  const out = chromiumProfileLookup(appName, profileDir || "Default", [
+    "workspace",
+    "uuid",
+    name,
+  ]);
+  return out && UUID_RE.test(out) ? out : null;
+}
+
+function resolveWorkspaceName(appName, profileDir, uuid) {
+  if (appName !== "Microsoft Edge") return null;
+  return chromiumProfileLookup(appName, profileDir || "Default", [
+    "workspace",
+    "name",
+    uuid,
+  ]);
+}
+
+function run(argv) {
+  let appName = "Chromium",
+    profile,
+    profileDir,
+    windowSpec,
+    ignoreQuery = false,
+    mode = "normal",
+    urls = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    let m;
+    if ((m = /^(?:-p(.+)?|--profile(?:=(.*))?)$/.exec(arg))) {
+      profile = m[1] ?? m[2] ?? argv[++i];
+    } else if ((m = /^(?:-d(.+)?|--profile-dir(?:=(.*))?)$/.exec(arg))) {
+      profileDir = m[1] ?? m[2] ?? argv[++i];
+    } else if ((m = /^(?:-w(.+)?|--window(?:=(.*))?)$/.exec(arg))) {
+      windowSpec = m[1] ?? m[2] ?? argv[++i];
+    } else if ((m = /^(?:-a(.+)?|--application(?:=(.*))?)$/.exec(arg))) {
+      appName = m[1] ?? m[2] ?? argv[++i];
+    } else if ((m = /^(?:-I|--ignore-query)$/.exec(arg))) {
+      ignoreQuery = true;
+    } else if (arg === "--incognito" || arg === "-i") {
+      mode = "incognito";
+    } else {
+      urls.push(arg);
+    }
+  }
+
+  if (urls.length === 0) urls.push(null);
+
+  // -d wins; otherwise fall back to the Profiles-menu display name (-p) and
+  // try to resolve it to a directory name for any flag-based dispatch.
+  if (!profileDir && profile) {
+    profileDir = resolveProfileDir(appName, profile);
+  }
+
+  const app = Application(appName);
+
+  // --launch-workspace is Edge-only, so workspace handling kicks in only
+  // for Microsoft Edge; for other Chromium browsers a UUID-looking spec is
+  // treated as just another window title to match.
+  const isEdge = appName === "Microsoft Edge";
+  let windowName;
+  if (windowSpec) {
+    for (const spec of windowSpec.split(":")) {
+      // Determine the (uuid, title) pair this spec resolves to:
+      //   - a UUID resolves to its workspace's display name (if known);
+      //   - a name resolves to its workspace UUID (if any).
+      // Either side may be missing: a window title with no matching
+      // workspace, or a UUID we cannot look up.
+      let uuid, title;
+      if (isEdge && UUID_RE.test(spec)) {
+        uuid = spec;
+        title = resolveWorkspaceName(appName, profileDir, spec);
+      } else {
+        title = spec;
+        uuid = isEdge ? resolveWorkspaceUuid(appName, profileDir, spec) : null;
+      }
+      // Prefer activating an already-open window matching the title;
+      // re-launching a workspace whose window is already open just spawns
+      // an extra empty-tab window instead of reusing the existing one.
+      // Just probe for existence here — the actual raise happens later in
+      // openUrl, which targets only the resolved window id.
+      if (title && app.running() && findWindowIdByTitle(app, title) != null) {
+        windowName = title;
+        break;
+      }
+      if (uuid) {
+        // launchWorkspace spawns a new window via `open -n`, which becomes
+        // the frontmost window on its own; pre-activating the app here
+        // would also raise every other window, defeating the purpose.
+        launchWorkspace(app, profileDir, uuid, urls);
+        return;
+      }
+    }
+  }
+
+  // Launch the app if needed without raising every window: activateWindowById
+  // below targets only the window we open the URL in, so all other windows
+  // keep their current z-order.
+  if (!app.running()) app.activate();
+
+  for (const url of urls) {
+    const urlRegExp = ignoreQuery
+      ? new RegExp(
+          `^${url.replace(/\?.*/, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\?.*)?$`,
+        )
+      : undefined;
+    openUrl(app, url, { urlRegExp, profile, windowName, mode });
+  }
+}

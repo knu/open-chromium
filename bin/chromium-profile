@@ -1,0 +1,380 @@
+#!/usr/bin/ruby
+# -*- ruby -*-
+#
+# chromium-profile: Look up profile and workspace metadata for a
+# Chromium-based browser (Microsoft Edge, Google Chrome, Chromium, ...).
+#
+# usage:
+#   chromium-profile [-a <app>] dir <profile-name>
+#   chromium-profile [-a <app>] [-p <profile-dir>] workspace uuid <name>
+#   chromium-profile [-a <app>] [-p <profile-dir>] workspace name <uuid>
+#   chromium-profile [-a <app>] [-p <profile-dir>] workspace list
+#
+#   -a <app>          Browser app name (default: "Microsoft Edge").
+#                     Examples: "Microsoft Edge", "Google Chrome", "Chromium".
+#   -p <profile-dir>  Profile directory name (default: "Default"), e.g.
+#                     "Default", "Profile 1".
+#
+# dir:        Resolve a profile display name (as shown in the browser) to its
+#             on-disk profile directory name by consulting "Local State".
+#             Multiple names can be given with ":", tried in order.  For
+#             Microsoft Edge a directory name also matches itself.
+# workspace:  Subcommands operating on Edge's Sync Data LevelDB:
+#   uuid <name>  Print the UUID of the workspace with the given name.
+#   name <uuid>  Print the display name of the workspace with the given UUID.
+#   list         Print "<uuid>\t<name>" for every workspace in the profile.
+#
+# Exits 0 on a unique match (single line printed), 1 on no match,
+# 2 on ambiguous match, 3 on usage or runtime error.
+
+require "fiddle"
+require "fiddle/import"
+require "fileutils"
+require "json"
+require "optparse"
+require "stringio"
+require "tmpdir"
+
+UUID_RE = /\A\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\z/.freeze
+KEY_PREFIX = "edge_workspace-dt-".freeze
+DYLIB_CANDIDATES = [
+  "/opt/homebrew/opt/leveldb/lib/libleveldb.dylib",
+  "/usr/local/opt/leveldb/lib/libleveldb.dylib",
+].freeze
+
+module LevelDB
+  extend Fiddle::Importer
+
+  def self.load!
+    dylib = DYLIB_CANDIDATES.find { |p| File.exist?(p) } or
+      raise "libleveldb.dylib not found; install via `brew install leveldb`"
+    dlload dylib
+    extern "void* leveldb_options_create()"
+    extern "void leveldb_options_destroy(void*)"
+    extern "void leveldb_options_set_create_if_missing(void*, char)"
+    extern "void leveldb_options_set_paranoid_checks(void*, char)"
+    extern "void* leveldb_readoptions_create()"
+    extern "void leveldb_readoptions_destroy(void*)"
+    extern "void leveldb_readoptions_set_verify_checksums(void*, char)"
+    extern "void leveldb_readoptions_set_fill_cache(void*, char)"
+    extern "void* leveldb_open(void*, const char*, void**)"
+    extern "void leveldb_close(void*)"
+    extern "void* leveldb_create_iterator(void*, void*)"
+    extern "void leveldb_iter_destroy(void*)"
+    extern "char leveldb_iter_valid(void*)"
+    extern "void leveldb_iter_seek(void*, const char*, size_t)"
+    extern "void leveldb_iter_next(void*)"
+    extern "const char* leveldb_iter_key(void*, size_t*)"
+    extern "const char* leveldb_iter_value(void*, size_t*)"
+    extern "void leveldb_iter_get_error(void*, char**)"
+    extern "void leveldb_free(void*)"
+  end
+end
+
+LevelDB.load!
+
+class WorkspaceReader
+  def initialize(db_path)
+    @db_path = db_path
+  end
+
+  # Yields [uuid, name] for each workspace metadata entry.
+  def each_workspace
+    open_db do |db|
+      ropts = LevelDB.leveldb_readoptions_create
+      LevelDB.leveldb_readoptions_set_verify_checksums(ropts, 0)
+      LevelDB.leveldb_readoptions_set_fill_cache(ropts, 0)
+      iter = LevelDB.leveldb_create_iterator(db, ropts)
+      begin
+        LevelDB.leveldb_iter_seek(iter, KEY_PREFIX, KEY_PREFIX.bytesize)
+        while LevelDB.leveldb_iter_valid(iter) != 0
+          key = read_slice { |sz| LevelDB.leveldb_iter_key(iter, sz) }
+          break unless key.start_with?(KEY_PREFIX)
+          value = read_slice { |sz| LevelDB.leveldb_iter_value(iter, sz) }
+          uuid, name = parse_metadata(key, value)
+          yield uuid, name if uuid && name
+          LevelDB.leveldb_iter_next(iter)
+        end
+        check_iter_error(iter)
+      ensure
+        LevelDB.leveldb_iter_destroy(iter)
+        LevelDB.leveldb_readoptions_destroy(ropts)
+      end
+    end
+  end
+
+  private
+
+  def open_db
+    do_open(@db_path) { |db| return yield(db) }
+  rescue RuntimeError => e
+    raise unless e.message.include?("lock") || e.message.include?("LOCK")
+    # Edge is running; snapshot the DB into a temp dir and open that.
+    Dir.mktmpdir("edge-workspace-ldb") { |tmp|
+      snapshot(@db_path, tmp)
+      do_open(tmp) { |db| return yield(db) }
+    }
+  end
+
+  def do_open(path)
+    opts = LevelDB.leveldb_options_create
+    LevelDB.leveldb_options_set_create_if_missing(opts, 0)
+    LevelDB.leveldb_options_set_paranoid_checks(opts, 0)
+    err = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP, Fiddle::RUBY_FREE)
+    err[0, Fiddle::SIZEOF_VOIDP] = "\0" * Fiddle::SIZEOF_VOIDP
+    db = LevelDB.leveldb_open(opts, path, err)
+    err_ptr = err.ptr
+    if !err_ptr.null?
+      msg = err_ptr.to_s
+      LevelDB.leveldb_free(err_ptr)
+      LevelDB.leveldb_options_destroy(opts)
+      raise msg
+    end
+    begin
+      yield db
+    ensure
+      LevelDB.leveldb_close(db) if db
+      LevelDB.leveldb_options_destroy(opts)
+    end
+  end
+
+  def snapshot(src, dst)
+    Dir.foreach(src) { |entry|
+      next if [".", "..", "LOCK"].include?(entry)
+      FileUtils.cp(File.join(src, entry), File.join(dst, entry))
+    }
+  end
+
+  def read_slice
+    size = Fiddle::Pointer.malloc(Fiddle::SIZEOF_SIZE_T, Fiddle::RUBY_FREE)
+    ptr = yield(size)
+    len = size[0, Fiddle::SIZEOF_SIZE_T].unpack1("J")
+    Fiddle::Pointer.new(ptr.to_i).to_str(len)
+  end
+
+  def check_iter_error(iter)
+    err = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP, Fiddle::RUBY_FREE)
+    err[0, Fiddle::SIZEOF_VOIDP] = "\0" * Fiddle::SIZEOF_VOIDP
+    LevelDB.leveldb_iter_get_error(iter, err)
+    err_ptr = err.ptr
+    return if err_ptr.null?
+    msg = err_ptr.to_s
+    LevelDB.leveldb_free(err_ptr)
+    raise msg
+  end
+
+  # The key is "edge_workspace-dt-<UUID>".  The value is a protobuf whose
+  # top-level field 2 holds a submessage.  For workspace metadata entries
+  # that submessage has field 4, which is itself a submessage whose field 1
+  # is the human-readable name; for tab entries the submessage has field 5
+  # (the parent workspace reference) and no field 4.  We return [uuid, name]
+  # only when the value looks like metadata and the embedded UUID matches
+  # the key suffix.
+  def parse_metadata(key, value)
+    uuid_in_key = key[KEY_PREFIX.bytesize..]
+    return nil unless UUID_RE.match?(uuid_in_key)
+    sub = decode_protobuf(value)[2]
+    return nil unless sub.is_a?(String)
+    inner = decode_protobuf(sub)
+    return nil if inner.key?(5) # tab entry
+    embedded_uuid = inner[1]
+    return nil unless embedded_uuid.is_a?(String) && UUID_RE.match?(embedded_uuid)
+    return nil unless embedded_uuid.casecmp?(uuid_in_key)
+    name_sub = inner[4]
+    return nil unless name_sub.is_a?(String)
+    name = decode_protobuf(name_sub)[1]
+    return nil unless name.is_a?(String) && !name.empty?
+    utf8 = force_utf8(name) or return nil
+    [embedded_uuid, utf8]
+  end
+
+  def force_utf8(str)
+    s = str.dup.force_encoding(Encoding::UTF_8)
+    s.valid_encoding? ? s : nil
+  end
+
+  # Minimal protobuf parser: only wire types 0 (varint), 1 (64-bit),
+  # 2 (length-delimited), and 5 (32-bit).  Returns a Hash{field_no => last_value};
+  # later occurrences overwrite earlier ones, which is enough for the fields
+  # we care about here.
+  def decode_protobuf(bytes)
+    out = {}
+    io = StringIO.new(bytes.b)
+    until io.eof?
+      tag = read_varint(io) or break
+      field = tag >> 3
+      wire = tag & 0x7
+      case wire
+      when 0
+        out[field] = read_varint(io)
+      when 1
+        out[field] = io.read(8)
+      when 2
+        len = read_varint(io)
+        out[field] = io.read(len)
+      when 5
+        out[field] = io.read(4)
+      else
+        break
+      end
+    end
+    out
+  end
+
+  def read_varint(io)
+    result = 0
+    shift = 0
+    loop do
+      byte = io.read(1) or return nil
+      b = byte.ord
+      result |= (b & 0x7f) << shift
+      return result if b < 0x80
+      shift += 7
+      return nil if shift > 63
+    end
+  end
+end
+
+def app_support_dir(app)
+  case app
+  when "Google Chrome"
+    File.expand_path("~/Library/Application Support/Google/Chrome")
+  else
+    File.expand_path("~/Library/Application Support/#{app}")
+  end
+end
+
+def db_path_for(app, profile)
+  base = "#{app_support_dir(app)}/#{profile}/Sync Data/LevelDB"
+  File.directory?(base) ? base : nil
+end
+
+# Returns the on-disk profile directory name (e.g. "Default", "Profile 2")
+# for a profile display name (e.g. "Personal", "WED"), looked up against the
+# browser's "Local State" info_cache.  For Microsoft Edge a directory name
+# also matches itself, since the launch flag takes the directory name.
+def resolve_profile_dir(app, name)
+  ls = "#{app_support_dir(app)}/Local State"
+  return nil unless File.file?(ls)
+  cache = JSON.parse(File.read(ls)).dig("profile", "info_cache") or return nil
+  case app
+  when "Microsoft Edge"
+    return name if cache.key?(name)
+    pair = cache.find { |_, info| info["name"] == name }
+  else
+    pair = cache.find { |dir, info| dir == name || info["name"] == name }
+  end
+  pair&.first
+end
+
+def emit_match(matches, kind, query)
+  case matches.size
+  when 0
+    warn "#{kind} not found: #{query}"
+    1
+  when 1
+    puts matches.first
+    0
+  else
+    warn "ambiguous #{kind}: #{query} -> #{matches.join(", ")}"
+    2
+  end
+end
+
+def cmd_uuid(reader, name)
+  matches = []
+  reader.each_workspace { |uuid, ws_name|
+    matches << uuid if ws_name == name
+  }
+  emit_match(matches.uniq, "workspace name", name)
+end
+
+def cmd_name(reader, uuid)
+  matches = []
+  reader.each_workspace { |ws_uuid, name|
+    matches << name if ws_uuid.casecmp?(uuid)
+  }
+  emit_match(matches.uniq, "workspace UUID", uuid)
+end
+
+def cmd_list(reader)
+  reader.each_workspace { |uuid, name| puts "#{uuid}\t#{name}" }
+  0
+end
+
+def cmd_dir(app, name)
+  name.split(":").each { |candidate|
+    dir = resolve_profile_dir(app, candidate)
+    if dir
+      puts dir
+      return 0
+    end
+  }
+  warn "profile not found in #{app}: #{name}"
+  1
+end
+
+def with_workspace_reader(app, profile)
+  base = db_path_for(app, profile) or begin
+    warn "no Sync Data/LevelDB under #{app}/#{profile}"
+    return 1
+  end
+  yield WorkspaceReader.new(base)
+end
+
+def cmd_workspace(app, profile, argv)
+  sub = argv.shift or abort "workspace: missing subcommand: uuid | name | list"
+  case sub
+  when "uuid"
+    arg = argv.shift or abort "workspace uuid: missing <name>"
+    abort "workspace uuid: extra arguments" unless argv.empty?
+    if UUID_RE.match?(arg)
+      puts arg
+      0
+    else
+      with_workspace_reader(app, profile) { |reader| cmd_uuid(reader, arg) }
+    end
+  when "name"
+    arg = argv.shift or abort "workspace name: missing <uuid>"
+    abort "workspace name: extra arguments" unless argv.empty?
+    abort "workspace name: not a UUID: #{arg}" unless UUID_RE.match?(arg)
+    with_workspace_reader(app, profile) { |reader| cmd_name(reader, arg) }
+  when "list"
+    abort "workspace list: extra arguments" unless argv.empty?
+    with_workspace_reader(app, profile) { |reader| cmd_list(reader) }
+  else
+    abort "workspace: unknown subcommand: #{sub}"
+  end
+end
+
+def main
+  app = "Microsoft Edge"
+  profile = "Default"
+  OptionParser.new { |o|
+    o.banner = "usage: #{File.basename($0)} [-a app] [-p profile-dir] " \
+               "dir <profile-name> | workspace uuid <name> | " \
+               "workspace name <uuid> | workspace list"
+    o.on("-a APP") { |v| app = v }
+    o.on("-p PROFILE") { |v| profile = v }
+  }.parse!
+
+  sub = ARGV.shift or abort "missing subcommand: dir | workspace"
+
+  case sub
+  when "dir"
+    arg = ARGV.shift or abort "dir: missing <profile-name>"
+    abort "dir: extra arguments" unless ARGV.empty?
+    cmd_dir(app, arg)
+  when "workspace"
+    cmd_workspace(app, profile, ARGV)
+  else
+    abort "unknown subcommand: #{sub}"
+  end
+end
+
+begin
+  exit main
+rescue => e
+  warn "#{File.basename($0)}: #{e.message}"
+  exit 3
+end

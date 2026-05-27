@@ -1,0 +1,134 @@
+#!/bin/sh
+
+set -e
+
+# for jq
+export PATH="$PATH:/usr/local/bin:/opt/homebrew/bin"
+
+myname=${0##*/}
+apps=
+default_apps="Microsoft Edge:Google Chrome:Chromium"
+incognito=
+ignore_query=
+profile=Default
+profile_specified=
+profile_dir=
+window=
+
+list_candidates() {
+    printf '%s' "${apps:+$apps:}$default_apps" |
+        awk -F: '{for(i=1;i<=NF;i++)if(!seen[$i]++)print $i}'
+}
+
+list_profiles() {
+    printf '%s' "$profile" |
+        awk -F: '{for(i=1;i<=NF;i++)print $i}'
+}
+
+while getopts a:d:iIp:w: o; do
+    case "$o" in
+        a) apps="$OPTARG" ;;
+        d) profile_dir="$OPTARG" ;;
+        i) incognito=t ;;
+        I) ignore_query=t ;;
+        p) profile="$OPTARG"; profile_specified=t ;;
+        w) window="$OPTARG" ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+first_app=
+matched_profile=
+matched_profile_dir=$profile_dir
+selected_app=
+if [ -n "$profile_dir" ]; then
+    while read -r app; do
+        [ -d "/Applications/$app.app" ] || continue
+        [ -n "$first_app" ] || first_app="$app"
+        [ -n "$selected_app" ] || selected_app="$app"
+    done <<EOF
+$(list_candidates)
+EOF
+elif [ -n "$profile_specified" ]; then
+    while read -r candidate_profile; do
+        while read -r app; do
+            [ -d "/Applications/$app.app" ] || continue
+            [ -n "$first_app" ] || first_app="$app"
+            case "$app" in
+                "Google Chrome")
+                    libdir="$HOME/Library/Application Support/Google/Chrome"
+                    ;;
+                "Chromium"|"Microsoft Edge")
+                    libdir="$HOME/Library/Application Support/$app"
+            esac
+            [ -f "$libdir/Local State" ] || continue
+            profile_match="$(
+                jq -r --arg app "$app" --arg profile "$candidate_profile" \
+                    'first(
+                        .profile.info_cache
+                        | to_entries[]
+                        | select(
+                            if $app == "Microsoft Edge"
+                            then .value.name == $profile
+                            else .key == $profile or .value.name == $profile
+                            end
+                          )
+                        | [.key, .value.name]
+                        | @tsv
+                      ) // empty' \
+                    "$libdir/Local State"
+            )" || continue
+            [ -n "$profile_match" ] || continue
+            profiledir=${profile_match%%	*}
+            profilename=${profile_match#*	}
+            matched_profile="$profilename"
+            matched_profile_dir="$profiledir"
+            selected_app="$app"
+            break 2
+        done <<EOF
+$(list_candidates)
+EOF
+    done <<EOF
+$(list_profiles)
+EOF
+else
+    while read -r app; do
+        [ -d "/Applications/$app.app" ] || continue
+        [ -n "$first_app" ] || first_app="$app"
+        [ -n "$selected_app" ] || selected_app="$app"
+    done <<EOF
+$(list_candidates)
+EOF
+fi
+
+if [ -n "$profile_specified" ] && [ -z "$selected_app" ]; then
+    echo "$myname: profile not found: $profile" >&2
+    exit 1
+fi
+
+app=${selected_app:-${first_app:-Google Chrome}}
+
+case "$1" in
+    *://*|'')
+        ;;
+    *)
+        if [ ! -f "$1" ]; then
+            echo "$myname: file not found: $1" >&2
+            exit 1
+        fi
+        set -- "file://$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
+esac
+
+export PATH="${0%/*}":$PATH
+
+# Pass both the display name (-p, drives the Profiles menu) and the directory
+# name (-d, drives --profile-directory / chromium-profile lookups) to
+# open-chromium; it picks the right one for each operation.
+open-chromium -a "$app" \
+    ${incognito:+-i} \
+    ${matched_profile:+-p "$matched_profile"} \
+    ${matched_profile_dir:+-d "$matched_profile_dir"} \
+    ${window:+-w "$window"} \
+    ${ignore_query:+-I} \
+    "$@"
