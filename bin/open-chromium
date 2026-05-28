@@ -91,9 +91,23 @@ function findWindowIdByTitle(app, windowName) {
   return target ? target.id() : null;
 }
 
+function frontWindowId(app, browserAppProc) {
+  try {
+    const focusedWindow = browserAppProc.attributes
+      .byName("AXFocusedWindow")
+      .value();
+    if (focusedWindow) return findWindowIdByTitle(app, focusedWindow.name());
+  } catch (e) {
+  }
+  const window = first(browserAppProc.windows());
+  if (!window) return null;
+  return findWindowIdByTitle(app, window.name());
+}
+
 function selectProfile(app, profile) {
   const system = Application("System Events");
   const browserAppProc = system.applicationProcesses.byName(app.name());
+  const initialFrontWindowId = frontWindowId(app, browserAppProc);
   const menuBar = browserAppProc.menuBars[0];
   const profileNames = profile.split(":");
   const menu = first(
@@ -124,23 +138,38 @@ function selectProfile(app, profile) {
       )(),
     ),
   );
-  if (!menuItem) return false;
+  if (!menuItem) return null;
 
   const menuItemName = menuItem.name();
+  const isSelected = () => {
+    try {
+      return (
+        menuBar.menus
+          .byName(menuName)
+          .menuItems.byName(menuItemName)
+          .attributes.byName("AXMenuItemMarkChar")
+          .value() === "✓"
+      );
+    } catch (e) {
+      return false;
+    }
+  };
+  const wasSelected = isSelected();
+  if (wasSelected) return initialFrontWindowId;
+
   menuItem.click();
 
-  const isSelected = () =>
-    menuBar.menus
-      .byName(menuName)
-      .menuItems.byName(menuItemName)
-      .attributes.byName("AXMenuItemMarkChar")
-      .value() === "✓";
-  // A successful profile-menu click leaves the menu item checked.  We no
-  // longer probe by raising other windows in turn — that side-effect was
-  // exactly what brought non-target profile windows to the front.  If the
-  // click did not stick, return false and let the caller recover (e.g. by
-  // locating a window of the requested profile and raising just that one).
-  return isSelected();
+  // Wait until the profile switch brings a different window to the front,
+  // then target that concrete window by id.
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    const selectedWindowId = frontWindowId(app, browserAppProc);
+    if (selectedWindowId !== initialFrontWindowId) {
+      if (isSelected()) return selectedWindowId;
+    }
+    delay(0.05);
+  }
+  return null;
 }
 
 function openUrlInWindow(app, window, url, urlRegExp) {
@@ -171,6 +200,32 @@ function openUrlInWindow(app, window, url, urlRegExp) {
   activateWindowById(app, window.id());
 }
 
+function openBrowserWithArgs(app, args) {
+  const cmd = [
+    "/usr/bin/open",
+    "-a",
+    quoteShellArg(app.name()),
+    ...(app.running() ? ["-n"] : []),
+    "--args",
+    ...args.map(quoteShellArg),
+  ].join(" ");
+
+  const shell = Application.currentApplication();
+  shell.includeStandardAdditions = true;
+  shell.doShellScript(cmd);
+  return true;
+}
+
+function launchBrowser(app, { profileDir, workspace, urls }) {
+  const args = [];
+  if (workspace) args.push("--launch-workspace=" + workspace);
+  if (profileDir) args.push("--profile-directory=" + profileDir);
+  for (const url of urls) {
+    if (url) args.push(url);
+  }
+  return openBrowserWithArgs(app, args);
+}
+
 // Pick the window to operate on.  When a preferredId is given (because the
 // caller resolved -w to a specific window title), use that window verbatim
 // so we don't accidentally fall back to whichever window happens to sit at
@@ -191,17 +246,23 @@ function getWindowInMode(app, mode, preferredId) {
   );
 }
 
-function openUrl(app, url, { urlRegExp, profile, windowName, mode }) {
+function openUrl(app, url, { urlRegExp, profile, profileDir, windowName, mode }) {
   if (windowName || profile) {
-    if (profile && !selectProfile(app, profile)) {
-      console.log("profile not found");
-    }
+    const selectedProfileWindowId = profile ? selectProfile(app, profile) : null;
 
     // Resolve -w to a concrete window id so we can target that one window
     // for raising via macwin-cli without disturbing other windows.
-    let targetId = null;
+    let targetId = selectedProfileWindowId;
     if (windowName) {
       targetId = findWindowIdByTitle(app, windowName);
+    }
+    if (targetId == null) {
+      if (profileDir && !windowName) {
+        launchBrowser(app, { profileDir, urls: [url] });
+        return;
+      }
+      console.log(profile ? "profile window not found" : "window not found");
+      return;
     }
 
     if (!url) {
@@ -235,30 +296,6 @@ function openUrl(app, url, { urlRegExp, profile, windowName, mode }) {
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function launchWorkspace(app, profileDir, workspace, urls) {
-  const args = ["--launch-workspace=" + workspace];
-  if (profileDir) {
-    args.push("--profile-directory=" + profileDir);
-  }
-  for (const url of urls) {
-    if (url) args.push(url);
-  }
-
-  const cmd = [
-    "/usr/bin/open",
-    "-a",
-    quoteShellArg(app.name()),
-    ...(app.running() ? ["-n"] : []),
-    "--args",
-    ...args.map(quoteShellArg),
-  ].join(" ");
-
-  const shell = Application.currentApplication();
-  shell.includeStandardAdditions = true;
-  shell.doShellScript(cmd);
-  return true;
-}
 
 function quoteShellArg(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
@@ -391,10 +428,10 @@ function run(argv) {
         break;
       }
       if (uuid) {
-        // launchWorkspace spawns a new window via `open -n`, which becomes
+        // launchBrowser spawns a new window via `open -n`, which becomes
         // the frontmost window on its own; pre-activating the app here
         // would also raise every other window, defeating the purpose.
-        launchWorkspace(app, profileDir, uuid, urls);
+        launchBrowser(app, { profileDir, workspace: uuid, urls });
         return;
       }
     }
@@ -411,6 +448,6 @@ function run(argv) {
           `^${url.replace(/\?.*/, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\?.*)?$`,
         )
       : undefined;
-    openUrl(app, url, { urlRegExp, profile, windowName, mode });
+    openUrl(app, url, { urlRegExp, profile, profileDir, windowName, mode });
   }
 }
