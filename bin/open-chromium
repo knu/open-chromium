@@ -26,10 +26,27 @@ function first(collection) {
   return collection.length > 0 ? collection[0] : null;
 }
 
-// Raise a single window to the front without disturbing the rest of the
-// app's window stack.  Delegates to macwin-cli, matching by JXA title.
-// Falls back to app-level activation if macwin-cli is unavailable or the
-// raise fails.
+// Activate the browser without asking macOS to raise every window belonging
+// to the app.
+function activateAppWithoutAllWindows(app) {
+  try {
+    ObjC.import("AppKit");
+    const runningApps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(
+      app.id(),
+    );
+    if (runningApps.count > 0) {
+      runningApps
+        .objectAtIndex(0)
+        .activateWithOptions($.NSApplicationActivateIgnoringOtherApps);
+      return true;
+    }
+  } catch (e) {
+  }
+  return false;
+}
+
+// Raise the target window, activate the app, then raise the target again in
+// case activation changed the window order.
 function activateWindowById(app, id) {
   const window = app.windows.byId(id);
   if (!window) {
@@ -37,7 +54,10 @@ function activateWindowById(app, id) {
     return false;
   }
   const title = window.title();
-  if (!raiseWindowByTitle(app.name(), title)) {
+  const raised = raiseWindowByTitle(app.name(), title);
+  if (activateAppWithoutAllWindows(app)) {
+    raiseWindowByTitle(app.name(), title);
+  } else if (!raised) {
     app.activate();
   }
   return true;
@@ -226,6 +246,17 @@ function launchBrowser(app, { profileDir, workspace, urls }) {
   return openBrowserWithArgs(app, args);
 }
 
+function findWindowInMode(app, mode) {
+  const windows = Array.from(app.windows());
+  return (
+    windows.find(
+      (window) => window.index() === 1 && window.mode() === mode,
+    ) ||
+    windows.find((window) => window.mode() === mode) ||
+    null
+  );
+}
+
 // Pick the window to operate on.  When a preferredId is given (because the
 // caller resolved -w to a specific window title), use that window verbatim
 // so we don't accidentally fall back to whichever window happens to sit at
@@ -237,13 +268,7 @@ function getWindowInMode(app, mode, preferredId) {
     );
     if (target) return target;
   }
-  return (
-    Array.from(app.windows()).find(
-      (window) => window.index() === 1 && window.mode() === mode,
-    ) ||
-    Array.from(app.windows()).find((window) => window.mode() === mode) ||
-    app.Window({ mode }).make()
-  );
+  return findWindowInMode(app, mode) || app.Window({ mode }).make();
 }
 
 function openUrl(app, url, { urlRegExp, profile, profileDir, windowName, mode }) {
@@ -257,6 +282,16 @@ function openUrl(app, url, { urlRegExp, profile, profileDir, windowName, mode })
       targetId = findWindowIdByTitle(app, windowName);
     }
     if (targetId == null) {
+      const existingWindow =
+        profileDir && !windowName ? findWindowInMode(app, mode) : null;
+      if (existingWindow) {
+        if (url) {
+          openUrlInWindow(app, existingWindow, url, urlRegExp);
+        } else {
+          activateWindowById(app, existingWindow.id());
+        }
+        return;
+      }
       if (profileDir && !windowName) {
         launchBrowser(app, { profileDir, urls: [url] });
         return;
