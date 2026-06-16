@@ -18,7 +18,9 @@
 //            For each candidate the matching window title is preferred; only
 //            if no such window is open is a workspace launch attempted.
 //            Multiple values can be given with :, tried in order until one
-//            succeeds.
+//            succeeds.  A leading ! negates the match: "!Name" selects any
+//            window whose title is not Name (preferring the front window),
+//            creating a new window if every open window is titled Name.
 //
 // If the URL is already opened in a tab, it is activated.
 
@@ -108,6 +110,20 @@ function findWindowIdByTitle(app, windowName) {
   const target = Array.from(app.windows()).find(
     (window) => window.title() === windowName,
   );
+  return target ? target.id() : null;
+}
+
+// Find the id of an app window in the given mode whose title is NOT
+// excludeName, preferring the front window (index 1).  Returns null if every
+// open window in this mode carries the excluded title.  This backs the
+// `-w '!Name'` negative form, which selects any window other than the named
+// one.
+function findWindowIdByTitleExcluding(app, excludeName, mode) {
+  const windows = Array.from(app.windows()).filter(
+    (window) => window.mode() === mode && window.title() !== excludeName,
+  );
+  const target =
+    windows.find((window) => window.index() === 1) || first(windows);
   return target ? target.id() : null;
 }
 
@@ -271,8 +287,12 @@ function getWindowInMode(app, mode, preferredId) {
   return findWindowInMode(app, mode) || app.Window({ mode }).make();
 }
 
-function openUrl(app, url, { urlRegExp, profile, profileDir, windowName, mode }) {
-  if (windowName || profile) {
+function openUrl(
+  app,
+  url,
+  { urlRegExp, profile, profileDir, windowName, excludeWindowName, mode },
+) {
+  if (windowName || excludeWindowName || profile) {
     const selectedProfileWindowId = profile ? selectProfile(app, profile) : null;
 
     // Resolve -w to a concrete window id so we can target that one window
@@ -280,6 +300,19 @@ function openUrl(app, url, { urlRegExp, profile, profileDir, windowName, mode })
     let targetId = selectedProfileWindowId;
     if (windowName) {
       targetId = findWindowIdByTitle(app, windowName);
+    } else if (excludeWindowName != null) {
+      // `-w '!Name'`: reuse any window other than the named one, falling back
+      // to a freshly made window when every open window carries that title.
+      targetId = findWindowIdByTitleExcluding(app, excludeWindowName, mode);
+      if (targetId == null) {
+        const window = app.Window({ mode }).make();
+        if (url) {
+          openUrlInWindow(app, window, url, urlRegExp);
+        } else {
+          activateWindowById(app, window.id());
+        }
+        return;
+      }
     }
     if (targetId == null) {
       const existingWindow =
@@ -437,9 +470,17 @@ function run(argv) {
   // for Microsoft Edge; for other Chromium browsers a UUID-looking spec is
   // treated as just another window title to match.
   const isEdge = appName === "Microsoft Edge";
-  let windowName;
+  let windowName, excludeWindowName;
   if (windowSpec) {
     for (const spec of windowSpec.split(":")) {
+      // `!Name`: select any window other than the named one, creating a new
+      // one if every open window carries that title.  Negation is a pure
+      // title test, so workspace resolution does not apply; the actual
+      // selection happens later in openUrl.
+      if (spec[0] === "!") {
+        excludeWindowName = spec.slice(1);
+        break;
+      }
       // Determine the (uuid, title) pair this spec resolves to:
       //   - a UUID resolves to its workspace's display name (if known);
       //   - a name resolves to its workspace UUID (if any).
@@ -483,6 +524,13 @@ function run(argv) {
           `^${url.replace(/\?.*/, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\?.*)?$`,
         )
       : undefined;
-    openUrl(app, url, { urlRegExp, profile, profileDir, windowName, mode });
+    openUrl(app, url, {
+      urlRegExp,
+      profile,
+      profileDir,
+      windowName,
+      excludeWindowName,
+      mode,
+    });
   }
 }

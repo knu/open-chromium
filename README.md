@@ -68,6 +68,12 @@ For Microsoft Edge, `-w` also accepts a workspace UUID or workspace name.  An al
 % open-browser -a "Microsoft Edge" -p Work -w "Project Alpha" https://example.com/
 ```
 
+A leading `!` negates the match: `-w '!Name'` selects any window whose title is *not* `Name` (preferring the front window), creating a new one if every open window is titled `Name`.  This is handy for keeping a dedicated window — say one named `Workspace` — untouched while routing everything else elsewhere:
+
+```console
+% open-browser -w '!Workspace' https://example.com/
+```
+
 Open in incognito mode:
 
 ```console
@@ -107,7 +113,7 @@ Exit status is `0` on a unique match, `1` on no match, `2` on ambiguous match, a
 - `-a APPS` — `:`-separated list of preferred browsers, tried in order; falls back to `Microsoft Edge:Google Chrome:Chromium`.
 - `-p PROFILE` — `:`-separated list of profile display names (as shown in the Profiles menu).
 - `-d PROFILE_DIR` — On-disk profile directory (e.g. `Default`, `Profile 2`).  Wins over `-p`.
-- `-w WINDOW` — `:`-separated list of window titles, or — for Microsoft Edge — workspace names or UUIDs.
+- `-w WINDOW` — `:`-separated list of window titles, or — for Microsoft Edge — workspace names or UUIDs.  A leading `!` (e.g. `!Name`) selects any window other than the named one, creating a new window if none exists.
 - `-i` — Open in incognito mode.
 - `-I` — Match tabs by URL ignoring the query string.
 
