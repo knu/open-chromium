@@ -68,7 +68,7 @@ For Microsoft Edge, `-w` also accepts a workspace UUID or workspace name.  An al
 % open-browser -a "Microsoft Edge" -p Work -w "Project Alpha" https://example.com/
 ```
 
-A leading `!` negates the match: `-w '!Name'` selects any window whose title is *not* `Name` (preferring the front window), creating a new one if every open window is titled `Name`.  This is handy for keeping a dedicated window — say one named `Workspace` — untouched while routing everything else elsewhere:
+A leading `!` negates the match: `-w '!Name'` selects any window whose title is *not* `Name` (preferring the front window), creating a new one if every matching window is titled `Name`.  This is handy for keeping a dedicated window — say one named `Workspace` — untouched while routing everything else elsewhere:
 
 ```console
 % open-browser -w '!Workspace' https://example.com/
@@ -129,6 +129,7 @@ Same flags as `open-browser`, except `-a` takes a single application name.
 ## How it works
 
 - Profile selection drives the browser's Profiles menu via System Events, so it works even when a browser does not expose `--profile-directory` on relaunch.
+- When `-p` is combined with `-w '!Name'`, `open-chromium` checks candidate windows against the Profiles menu and caches `pid` + window id → profile mappings for 6 hours to avoid repeatedly cycling through windows.
 - When `macwin-cli` is available, the target window is raised by title without disturbing the rest of the application's window stack.  Without it, `open-chromium` falls back to app-level activation.
 - Edge workspaces are resolved from the profile's `Sync Data/LevelDB`.  If Edge is running and holds the database lock, `chromium-profile` snapshots the LevelDB files to a temporary directory and opens that copy.
 

@@ -28,38 +28,168 @@ function first(collection) {
   return collection.length > 0 ? collection[0] : null;
 }
 
-// Activate the browser without asking macOS to raise every window belonging
-// to the app.
-function activateAppWithoutAllWindows(app) {
-  try {
-    ObjC.import("AppKit");
-    const runningApps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(
-      app.id(),
-    );
-    if (runningApps.count > 0) {
-      runningApps
-        .objectAtIndex(0)
-        .activateWithOptions($.NSApplicationActivateIgnoringOtherApps);
-      return true;
-    }
-  } catch (e) {
-  }
-  return false;
+const PROFILE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function cacheFilePath() {
+  ObjC.import("Foundation");
+  const home = $.NSHomeDirectory().js;
+  return `${home}/Library/Caches/open-chromium/window-profiles.json`;
 }
 
-// Raise the target window, activate the app, then raise the target again in
-// case activation changed the window order.
-function activateWindowById(app, id) {
+function ensureParentDirectory(path) {
+  ObjC.import("Foundation");
+  const dir = $.NSString.alloc
+    .initWithUTF8String(path)
+    .stringByDeletingLastPathComponent.js;
+  $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(
+    dir,
+    true,
+    $(),
+    $(),
+  );
+}
+
+function readProfileCache() {
+  ObjC.import("Foundation");
+  const path = cacheFilePath();
+  if (!$.NSFileManager.defaultManager.fileExistsAtPath(path)) return {};
+  try {
+    const text = $.NSString.stringWithContentsOfFileEncodingError(
+      path,
+      $.NSUTF8StringEncoding,
+      $(),
+    ).js;
+    if (!text) return {};
+    return JSON.parse(text);
+  } catch (e) {
+    return {};
+  }
+}
+
+function writeProfileCache(cache) {
+  ObjC.import("Foundation");
+  const path = cacheFilePath();
+  ensureParentDirectory(path);
+  $.NSString.alloc
+    .initWithUTF8String(JSON.stringify(cache))
+    .writeToFileAtomicallyEncodingError(
+      path,
+      true,
+      $.NSUTF8StringEncoding,
+      $(),
+    );
+}
+
+function prunedProfileCache(cache, now) {
+  const pruned = {};
+  for (const [key, entry] of Object.entries(cache)) {
+    if (now - entry.updatedAt < PROFILE_CACHE_TTL_MS) pruned[key] = entry;
+  }
+  return pruned;
+}
+
+function browserPid(app) {
+  try {
+    return Application("System Events").applicationProcesses
+      .byName(app.name())
+      .unixId();
+  } catch (e) {
+    return null;
+  }
+}
+
+function appCacheId(app) {
+  try {
+    return app.name();
+  } catch (e) {
+    return "unknown";
+  }
+}
+
+function profileCacheKey(app, pid, windowId) {
+  return `${appCacheId(app)}:${pid}:${windowId}`;
+}
+
+function cachedWindowProfile(cache, app, pid, windowId) {
+  if (pid == null) return null;
+  const entry = cache[profileCacheKey(app, pid, windowId)];
+  if (!entry) return null;
+  if (entry.profileKey && entry.profileKey.startsWith("not:")) {
+    return { notProfileKeys: [entry.profileKey.slice(4)] };
+  }
+  return entry;
+}
+
+function storeWindowProfile(app, pid, windowId, profileKey, extra) {
+  if (pid == null || !profileKey) return;
+  const now = Date.now();
+  const cache = prunedProfileCache(readProfileCache(), now);
+  setCachedWindowProfile(cache, app, pid, windowId, profileKey, now, extra);
+  writeProfileCache(cache);
+}
+
+function setCachedWindowProfile(
+  cache,
+  app,
+  pid,
+  windowId,
+  profileKey,
+  now,
+  extra,
+) {
+  if (pid == null || !profileKey) return;
+  cache[profileCacheKey(app, pid, windowId)] = {
+    profileKey,
+    updatedAt: now,
+    ...(extra || {}),
+  };
+}
+
+function setCachedWindowNotProfile(cache, app, pid, windowId, profileKey, now) {
+  if (pid == null || !profileKey) return;
+  const key = profileCacheKey(app, pid, windowId);
+  const entry = cachedWindowProfile(cache, app, pid, windowId) || {};
+  const notProfileKeys = entry.notProfileKeys || [];
+  if (!notProfileKeys.includes(profileKey)) notProfileKeys.push(profileKey);
+  cache[key] = {
+    notProfileKeys,
+    updatedAt: now,
+  };
+}
+
+function cacheExcludesProfile(entry, profileKey) {
+  return !!entry && (entry.notProfileKeys || []).includes(profileKey);
+}
+
+function findCachedWindowByTitleInProfile(app, windowName, mode, profileKey) {
+  if (!profileKey) return null;
+  const pid = browserPid(app);
+  const now = Date.now();
+  const cache = prunedProfileCache(readProfileCache(), now);
+  const target = Array.from(app.windows()).find((window) => {
+    if (window.mode() !== mode || window.title() !== windowName) return false;
+    const entry = cachedWindowProfile(cache, app, pid, window.id());
+    return entry && entry.profileKey === profileKey;
+  });
+  if (!target) return null;
+  return target.id();
+}
+
+// Raise the target window.  When a concrete title is requested, do not fall
+// back to app-level activation because that can foreground a different window.
+function activateWindowById(app, id, preferredTitle) {
   const window = app.windows.byId(id);
   if (!window) {
     console.log("window is gone!");
     return false;
   }
-  const title = window.title();
+  const title = preferredTitle || window.title();
   const raised = raiseWindowByTitle(app.name(), title);
-  if (activateAppWithoutAllWindows(app)) {
-    raiseWindowByTitle(app.name(), title);
-  } else if (!raised) {
+  if (!raised) {
+    if (preferredTitle) {
+      console.log("window raise failed");
+      return false;
+    }
     app.activate();
   }
   return true;
@@ -69,7 +199,7 @@ function raiseWindowByTitle(appName, title) {
   const shell = Application.currentApplication();
   shell.includeStandardAdditions = true;
   const cmd = [
-    "macwin-cli",
+    quoteShellArg(macwinCliPath()),
     "find",
     "--app",
     quoteShellArg(appName),
@@ -85,6 +215,23 @@ function raiseWindowByTitle(appName, title) {
   } catch (e) {
     return false;
   }
+}
+
+function macwinCliPath() {
+  ObjC.import("Foundation");
+  for (const path of [
+    "/opt/homebrew/bin/macwin-cli",
+    "/usr/local/bin/macwin-cli",
+    "macwin-cli",
+  ]) {
+    if (
+      path.indexOf("/") < 0 ||
+      $.NSFileManager.defaultManager.fileExistsAtPath(path)
+    ) {
+      return path;
+    }
+  }
+  return "macwin-cli";
 }
 
 function activateTabById(window, id) {
@@ -127,23 +274,9 @@ function findWindowIdByTitleExcluding(app, excludeName, mode) {
   return target ? target.id() : null;
 }
 
-function frontWindowId(app, browserAppProc) {
-  try {
-    const focusedWindow = browserAppProc.attributes
-      .byName("AXFocusedWindow")
-      .value();
-    if (focusedWindow) return findWindowIdByTitle(app, focusedWindow.name());
-  } catch (e) {
-  }
-  const window = first(browserAppProc.windows());
-  if (!window) return null;
-  return findWindowIdByTitle(app, window.name());
-}
-
-function selectProfile(app, profile) {
+function profileMenuSelection(app, profile) {
   const system = Application("System Events");
   const browserAppProc = system.applicationProcesses.byName(app.name());
-  const initialFrontWindowId = frontWindowId(app, browserAppProc);
   const menuBar = browserAppProc.menuBars[0];
   const profileNames = profile.split(":");
   const menu = first(
@@ -177,23 +310,122 @@ function selectProfile(app, profile) {
   if (!menuItem) return null;
 
   const menuItemName = menuItem.name();
-  const isSelected = () => {
-    try {
-      return (
-        menuBar.menus
-          .byName(menuName)
-          .menuItems.byName(menuItemName)
-          .attributes.byName("AXMenuItemMarkChar")
-          .value() === "✓"
-      );
-    } catch (e) {
-      return false;
-    }
+  return {
+    browserAppProc,
+    menu,
+    menuItem,
+    isSelected: () => {
+      try {
+        return (
+          menuBar.menus
+            .byName(menuName)
+            .menuItems.byName(menuItemName)
+            .attributes.byName("AXMenuItemMarkChar")
+            .value() === "✓"
+        );
+      } catch (e) {
+        return false;
+      }
+    },
+    selectedProfileName: () => {
+      try {
+        return (
+          Array.from(menu.menuItems()).find((item) => {
+            try {
+              return (
+                item.attributes.byName("AXMenuItemMarkChar").value() === "✓"
+              );
+            } catch (e) {
+              return false;
+            }
+          }) || null
+        )?.name();
+      } catch (e) {
+        return null;
+      }
+    },
   };
-  const wasSelected = isSelected();
+}
+
+function profileKeyForMenuName(appName, profileName) {
+  if (!profileName) return null;
+  const profileDir = resolveProfileDir(appName, profileName);
+  return profileDir ? `dir:${profileDir}` : `name:${profileName}`;
+}
+
+function findWindowIdByTitleExcludingInProfile(
+  app,
+  excludeName,
+  mode,
+  profile,
+  profileKey,
+) {
+  const windows = Array.from(app.windows())
+    .filter((window) => window.mode() === mode && window.title() !== excludeName)
+    .sort((a, b) => a.index() - b.index());
+  if (windows.length === 0) return null;
+
+  const pid = browserPid(app);
+  const now = Date.now();
+  const cache = prunedProfileCache(readProfileCache(), now);
+  const cached = windows.find((window) => {
+    const entry = cachedWindowProfile(cache, app, pid, window.id());
+    return entry && entry.profileKey === profileKey;
+  });
+  if (cached) return cached.id();
+
+  const selection = profileMenuSelection(app, profile);
+  if (!selection) return null;
+  let cacheChanged = false;
+  for (const window of windows) {
+    const entry = cachedWindowProfile(cache, app, pid, window.id());
+    if (entry && entry.profileKey && entry.profileKey !== profileKey) continue;
+    if (cacheExcludesProfile(entry, profileKey)) continue;
+
+    activateWindowById(app, window.id());
+    delay(0.05);
+    if (selection.isSelected()) {
+      setCachedWindowProfile(cache, app, pid, window.id(), profileKey, now);
+      writeProfileCache(cache);
+      return window.id();
+    }
+    const actualProfileKey = profileKeyForMenuName(
+      app.name(),
+      selection.selectedProfileName(),
+    );
+    if (actualProfileKey) {
+      setCachedWindowProfile(cache, app, pid, window.id(), actualProfileKey, now);
+    } else {
+      setCachedWindowNotProfile(cache, app, pid, window.id(), profileKey, now);
+    }
+    cacheChanged = true;
+  }
+  if (cacheChanged) writeProfileCache(cache);
+  return null;
+}
+
+function frontWindowId(app, browserAppProc) {
+  try {
+    const focusedWindow = browserAppProc.attributes
+      .byName("AXFocusedWindow")
+      .value();
+    if (focusedWindow) return findWindowIdByTitle(app, focusedWindow.name());
+  } catch (e) {
+  }
+  const window = first(browserAppProc.windows());
+  if (!window) return null;
+  return findWindowIdByTitle(app, window.name());
+}
+
+function selectProfile(app, profile) {
+  const selection = profileMenuSelection(app, profile);
+  if (!selection) return null;
+  const browserAppProc = selection.browserAppProc;
+  const initialFrontWindowId = frontWindowId(app, browserAppProc);
+  const wasSelected = selection.isSelected();
   if (wasSelected) return initialFrontWindowId;
 
-  menuItem.click();
+  selection.menuItem.click();
 
   // Wait until the profile switch brings a different window to the front,
   // then target that concrete window by id.
@@ -201,14 +433,20 @@ function selectProfile(app, profile) {
   while (Date.now() < deadline) {
     const selectedWindowId = frontWindowId(app, browserAppProc);
     if (selectedWindowId !== initialFrontWindowId) {
-      if (isSelected()) return selectedWindowId;
+      if (selection.isSelected()) return selectedWindowId;
     }
     delay(0.05);
   }
   return null;
 }
 
-function openUrlInWindow(app, window, url, urlRegExp) {
+function openUrlInWindow(
+  app,
+  window,
+  url,
+  urlRegExp,
+  preferredTitle,
+) {
   const tab = findTabByURL(window, urlRegExp ?? url);
   if (tab) {
     activateTabById(window, tab.id());
@@ -233,7 +471,7 @@ function openUrlInWindow(app, window, url, urlRegExp) {
     }
   }
 
-  activateWindowById(app, window.id());
+  activateWindowById(app, window.id(), preferredTitle);
 }
 
 function openBrowserWithArgs(app, args) {
@@ -287,24 +525,74 @@ function getWindowInMode(app, mode, preferredId) {
   return findWindowInMode(app, mode) || app.Window({ mode }).make();
 }
 
+function windowById(app, id) {
+  if (id == null) return null;
+  return Array.from(app.windows()).find((window) => window.id() === id) || null;
+}
+
 function openUrl(
   app,
   url,
-  { urlRegExp, profile, profileDir, windowName, excludeWindowName, mode },
+  {
+    urlRegExp,
+    profile,
+    profileDir,
+    profileKey,
+    windowName,
+    excludeWindowName,
+    mode,
+  },
 ) {
-  if (windowName || excludeWindowName || profile) {
-    const selectedProfileWindowId = profile ? selectProfile(app, profile) : null;
+  if (windowName || excludeWindowName != null || profile) {
+    const cachedTarget = windowName
+      ? findCachedWindowByTitleInProfile(app, windowName, mode, profileKey)
+      : null;
+    let targetId = cachedTarget;
+    if (!url && windowName && targetId != null) {
+      storeWindowProfile(app, browserPid(app), targetId, profileKey);
+      activateWindowById(app, targetId, windowName);
+      return;
+    }
+    const selectedProfileWindowId =
+      profile && targetId == null ? selectProfile(app, profile) : null;
+    if (selectedProfileWindowId != null) {
+      storeWindowProfile(
+        app,
+        browserPid(app),
+        selectedProfileWindowId,
+        profileKey,
+      );
+    }
 
     // Resolve -w to a concrete window id so we can target that one window
     // for raising via macwin-cli without disturbing other windows.
-    let targetId = selectedProfileWindowId;
-    if (windowName) {
+    if (targetId == null) {
+      targetId = selectedProfileWindowId;
+    }
+    if (windowName && targetId == null) {
       targetId = findWindowIdByTitle(app, windowName);
     } else if (excludeWindowName != null) {
       // `-w '!Name'`: reuse any window other than the named one, falling back
       // to a freshly made window when every open window carries that title.
-      targetId = findWindowIdByTitleExcluding(app, excludeWindowName, mode);
+      const selectedWindow = windowById(app, selectedProfileWindowId);
+      if (selectedWindow && selectedWindow.title() !== excludeWindowName) {
+        targetId = selectedProfileWindowId;
+      } else if (profile && profileKey) {
+        targetId = findWindowIdByTitleExcludingInProfile(
+          app,
+          excludeWindowName,
+          mode,
+          profile,
+          profileKey,
+        );
+      } else {
+        targetId = findWindowIdByTitleExcluding(app, excludeWindowName, mode);
+      }
       if (targetId == null) {
+        if (profileDir) {
+          launchBrowser(app, { profileDir, urls: [url] });
+          return;
+        }
         const window = app.Window({ mode }).make();
         if (url) {
           openUrlInWindow(app, window, url, urlRegExp);
@@ -334,15 +622,26 @@ function openUrl(
     }
 
     if (!url) {
-      activateWindowById(app, getWindowInMode(app, mode, targetId).id());
+      if (windowName && profileKey) {
+        storeWindowProfile(app, browserPid(app), targetId, profileKey);
+      }
+      activateWindowById(
+        app,
+        getWindowInMode(app, mode, targetId).id(),
+        windowName,
+      );
       return;
     }
 
+    if (windowName && profileKey) {
+      storeWindowProfile(app, browserPid(app), targetId, profileKey);
+    }
     openUrlInWindow(
       app,
       getWindowInMode(app, mode, targetId),
       url,
       urlRegExp,
+      windowName,
     );
   } else {
     if (!url) {
@@ -369,29 +668,13 @@ function quoteShellArg(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
 
-// Path to this script's directory, where the chromium-profile helper is
-// expected to live as a sibling.  Falls back to null when osascript was
-// invoked without a script file (e.g. via stdin), in which case PATH-based
-// lookup takes over.
-const SCRIPT_DIR = (function () {
-  ObjC.import("Foundation");
-  const argv = $.NSProcessInfo.processInfo.arguments;
-  const last = argv.count > 0 ? argv.objectAtIndex(argv.count - 1).js : "";
-  if (!last || last === "-") return null;
-  return $.NSString.alloc
-    .initWithUTF8String(last)
-    .stringByResolvingSymlinksInPath.stringByDeletingLastPathComponent.js;
-})();
-
 // Invoke the chromium-profile helper.  `args` is an array of CLI arguments
 // appended after the global options.  Returns the captured stdout (trimmed)
 // on success, or null on error / empty output.
 function chromiumProfileLookup(appName, profileDir, args) {
   const shell = Application.currentApplication();
   shell.includeStandardAdditions = true;
-  const helper = SCRIPT_DIR
-    ? SCRIPT_DIR + "/chromium-profile"
-    : "chromium-profile";
+  const helper = "chromium-profile";
   const head = [helper, "-a", appName];
   if (profileDir) head.push("-p", profileDir);
   const cmd =
@@ -528,6 +811,11 @@ function run(argv) {
       urlRegExp,
       profile,
       profileDir,
+      profileKey: profileDir
+        ? `dir:${profileDir}`
+        : profile
+          ? `name:${profile}`
+          : null,
       windowName,
       excludeWindowName,
       mode,
