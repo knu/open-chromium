@@ -175,6 +175,22 @@ function findCachedWindowByTitleInProfile(app, windowName, mode, profileKey) {
   return target.id();
 }
 
+function findCachedWindowInProfile(app, mode, profileKey) {
+  if (!profileKey) return null;
+  const pid = browserPid(app);
+  const now = Date.now();
+  const cache = prunedProfileCache(readProfileCache(), now);
+  const target = Array.from(app.windows())
+    .filter((window) => window.mode() === mode)
+    .sort((a, b) => a.index() - b.index())
+    .find((window) => {
+      const entry = cachedWindowProfile(cache, app, pid, window.id());
+      return entry && entry.profileKey === profileKey;
+    });
+  if (!target) return null;
+  return target.id();
+}
+
 // Raise the target window.  When a concrete title is requested, do not fall
 // back to app-level activation because that can foreground a different window.
 function activateWindowById(app, id, preferredTitle) {
@@ -543,10 +559,11 @@ function openUrl(
     mode,
   },
 ) {
-  if (windowName || excludeWindowName != null || profile) {
-    const cachedTarget = windowName
-      ? findCachedWindowByTitleInProfile(app, windowName, mode, profileKey)
-      : null;
+  if (windowName || excludeWindowName != null || profile || profileDir) {
+    const cachedTarget =
+      windowName
+        ? findCachedWindowByTitleInProfile(app, windowName, mode, profileKey)
+        : findCachedWindowInProfile(app, mode, profileKey);
     let targetId = cachedTarget;
     if (!url && windowName && targetId != null) {
       storeWindowProfile(app, browserPid(app), targetId, profileKey);
@@ -603,16 +620,6 @@ function openUrl(
       }
     }
     if (targetId == null) {
-      const existingWindow =
-        profileDir && !windowName ? findWindowInMode(app, mode) : null;
-      if (existingWindow) {
-        if (url) {
-          openUrlInWindow(app, existingWindow, url, urlRegExp);
-        } else {
-          activateWindowById(app, existingWindow.id());
-        }
-        return;
-      }
       if (profileDir && !windowName) {
         launchBrowser(app, { profileDir, urls: [url] });
         return;
@@ -622,7 +629,7 @@ function openUrl(
     }
 
     if (!url) {
-      if (windowName && profileKey) {
+      if (profileKey) {
         storeWindowProfile(app, browserPid(app), targetId, profileKey);
       }
       activateWindowById(
@@ -633,7 +640,7 @@ function openUrl(
       return;
     }
 
-    if (windowName && profileKey) {
+    if (profileKey) {
       storeWindowProfile(app, browserPid(app), targetId, profileKey);
     }
     openUrlInWindow(
