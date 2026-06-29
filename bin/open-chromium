@@ -491,6 +491,17 @@ function openUrlInWindow(
 }
 
 function openBrowserWithArgs(app, args) {
+  const executable = browserExecutablePath(app);
+  if (executable) {
+    const cmd =
+      [quoteShellArg(executable), ...args.map(quoteShellArg)].join(" ") +
+      " >/dev/null 2>&1 &";
+    const shell = Application.currentApplication();
+    shell.includeStandardAdditions = true;
+    shell.doShellScript(cmd);
+    return true;
+  }
+
   const cmd = [
     "/usr/bin/open",
     "-a",
@@ -506,8 +517,39 @@ function openBrowserWithArgs(app, args) {
   return true;
 }
 
-function launchBrowser(app, { profileDir, workspace, urls }) {
+function browserExecutablePath(app) {
+  ObjC.import("Foundation");
+  const bundlePath = appBundlePath(app);
+  if (!bundlePath) return null;
+  const infoPath = `${bundlePath}/Contents/Info.plist`;
+  const info = $.NSDictionary.dictionaryWithContentsOfFile(infoPath);
+  if (!info) return null;
+  const executable = info.objectForKey("CFBundleExecutable");
+  if (!executable) return null;
+  const path = `${bundlePath}/Contents/MacOS/${executable.js}`;
+  return $.NSFileManager.defaultManager.fileExistsAtPath(path) ? path : null;
+}
+
+function appBundlePath(app) {
+  ObjC.import("AppKit");
+  try {
+    const url =
+      $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier(
+        app.id(),
+      );
+    if (url) return url.path.js;
+  } catch (e) {
+  }
+  try {
+    return app.path();
+  } catch (e) {
+    return null;
+  }
+}
+
+function launchBrowser(app, { profileDir, workspace, urls, mode }) {
   const args = [];
+  if (mode === "incognito") args.push("--incognito");
   if (workspace) args.push("--launch-workspace=" + workspace);
   if (profileDir) args.push("--profile-directory=" + profileDir);
   for (const url of urls) {
@@ -559,6 +601,16 @@ function openUrl(
     mode,
   },
 ) {
+  if (
+    mode === "incognito" &&
+    profileDir &&
+    !windowName &&
+    excludeWindowName == null
+  ) {
+    launchBrowser(app, { profileDir, urls: [url], mode });
+    return;
+  }
+
   if (windowName || excludeWindowName != null || profile || profileDir) {
     const cachedTarget =
       windowName
@@ -607,7 +659,11 @@ function openUrl(
       }
       if (targetId == null) {
         if (profileDir) {
-          launchBrowser(app, { profileDir, urls: [url] });
+          launchBrowser(app, { profileDir, urls: [url], mode });
+          return;
+        }
+        if (mode === "incognito") {
+          launchBrowser(app, { profileDir, urls: [url], mode });
           return;
         }
         const window = app.Window({ mode }).make();
@@ -621,7 +677,7 @@ function openUrl(
     }
     if (targetId == null) {
       if (profileDir && !windowName) {
-        launchBrowser(app, { profileDir, urls: [url] });
+        launchBrowser(app, { profileDir, urls: [url], mode });
         return;
       }
       console.log(profile ? "profile window not found" : "window not found");
@@ -652,7 +708,14 @@ function openUrl(
     );
   } else {
     if (!url) {
-      activateWindowById(app, getWindowInMode(app, mode).id());
+      const window = findWindowInMode(app, mode);
+      if (window) {
+        activateWindowById(app, window.id());
+      } else if (mode === "incognito") {
+        launchBrowser(app, { urls: [], mode });
+      } else {
+        activateWindowById(app, getWindowInMode(app, mode).id());
+      }
       return;
     }
     Array.from(app.windows()).find((window, i) => {
@@ -664,7 +727,10 @@ function openUrl(
         return true;
       }
       return false;
-    }) || openUrlInWindow(app, getWindowInMode(app, mode), url, urlRegExp);
+    }) ||
+      (mode === "incognito"
+        ? launchBrowser(app, { urls: [url], mode })
+        : openUrlInWindow(app, getWindowInMode(app, mode), url, urlRegExp));
   }
 }
 
@@ -797,7 +863,7 @@ function run(argv) {
         // launchBrowser spawns a new window via `open -n`, which becomes
         // the frontmost window on its own; pre-activating the app here
         // would also raise every other window, defeating the purpose.
-        launchBrowser(app, { profileDir, workspace: uuid, urls });
+        launchBrowser(app, { profileDir, workspace: uuid, urls, mode });
         return;
       }
     }
@@ -806,7 +872,13 @@ function run(argv) {
   // Launch the app if needed without raising every window: activateWindowById
   // below targets only the window we open the URL in, so all other windows
   // keep their current z-order.
-  if (!app.running()) app.activate();
+  if (!app.running()) {
+    if (mode === "incognito") {
+      launchBrowser(app, { profileDir, urls, mode });
+      return;
+    }
+    app.activate();
+  }
 
   for (const url of urls) {
     const urlRegExp = ignoreQuery
