@@ -490,6 +490,32 @@ function openUrlInWindow(
   activateWindowById(app, window.id(), preferredTitle);
 }
 
+function openUrlInExistingWindowOrLaunch(
+  app,
+  url,
+  { urlRegExp, profileDir, mode },
+) {
+  const window = findWindowInMode(app, mode);
+  if (window) {
+    openUrlInWindow(app, window, url, urlRegExp);
+  } else {
+    launchBrowser(app, { profileDir, urls: [url], mode });
+  }
+}
+
+function activateExistingTabInMode(app, mode, url) {
+  return Array.from(app.windows()).find((window) => {
+    if (window.mode() !== mode) return false;
+    const tab = findTabByURL(window, url);
+    if (tab) {
+      activateWindowById(app, window.id());
+      activateTabById(window, tab.id());
+      return true;
+    }
+    return false;
+  });
+}
+
 function openBrowserWithArgs(app, args) {
   const executable = browserExecutablePath(app);
   if (executable) {
@@ -602,11 +628,28 @@ function openUrl(
   },
 ) {
   if (
+    !url &&
     mode === "incognito" &&
-    profileDir &&
     !windowName &&
     excludeWindowName == null
   ) {
+    const window = findWindowInMode(app, mode);
+    if (window) {
+      activateWindowById(app, window.id());
+    } else {
+      launchBrowser(app, { profileDir, urls: [], mode });
+    }
+    return;
+  }
+
+  if (
+    mode === "incognito" &&
+    profileDir &&
+    url &&
+    !windowName &&
+    excludeWindowName == null
+  ) {
+    if (activateExistingTabInMode(app, mode, urlRegExp ?? url)) return;
     launchBrowser(app, { profileDir, urls: [url], mode });
     return;
   }
@@ -718,18 +761,9 @@ function openUrl(
       }
       return;
     }
-    Array.from(app.windows()).find((window, i) => {
-      if (window.mode() !== mode) return false;
-      const tab = findTabByURL(window, urlRegExp ?? url);
-      if (tab) {
-        activateWindowById(app, window.id());
-        activateTabById(window, tab.id());
-        return true;
-      }
-      return false;
-    }) ||
+    activateExistingTabInMode(app, mode, urlRegExp ?? url) ||
       (mode === "incognito"
-        ? launchBrowser(app, { urls: [url], mode })
+        ? openUrlInExistingWindowOrLaunch(app, url, { urlRegExp, mode })
         : openUrlInWindow(app, getWindowInMode(app, mode), url, urlRegExp));
   }
 }
