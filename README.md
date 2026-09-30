@@ -6,7 +6,13 @@ Command line tools for opening URLs in Chromium-based browsers on macOS — pick
 
 ## Installation
 
-Drop the scripts somewhere on your `PATH`:
+Install with mise on macOS:
+
+```sh
+mise use -g github:knu/open-chromium@latest
+```
+
+Or drop the scripts somewhere on your `PATH`:
 
 ```console
 % git clone https://github.com/knu/open-chromium.git
